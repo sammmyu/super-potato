@@ -1,0 +1,5 @@
+# Processor environments and downloaded models (recreated by the Install buttons)
+.venv/
+.venv-*/
+__pycache__/
+*.pyc

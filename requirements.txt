@@ -1,0 +1,2 @@
+homr[cpu]==0.7.1
+tkinterdnd2==0.7.0
