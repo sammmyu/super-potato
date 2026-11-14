@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import subprocess
@@ -326,7 +327,251 @@ def downgrade_to_2_0(root: ET.Element) -> None:
                     parent.remove(child)
 
 
-def clean_for_sibelius(root: ET.Element, title: str | None, composer: str | None) -> None:
+# Length of each note value, in crotchets.
+TYPE_QUARTERS = {"breve": Fraction(8), "whole": Fraction(4), "half": Fraction(2),
+                 "quarter": Fraction(1), "eighth": Fraction(1, 2), "16th": Fraction(1, 4),
+                 "32nd": Fraction(1, 8), "64th": Fraction(1, 16), "128th": Fraction(1, 32),
+                 "256th": Fraction(1, 64)}
+
+
+def printed_length(note: ET.Element) -> Fraction | None:
+    """Length in crotchets implied by a note's printed value, dots and tuplet."""
+    base = TYPE_QUARTERS.get(note.findtext("type") or "")
+    if base is None:
+        return None
+    length = base * (2 - Fraction(1, 2 ** len(note.findall("dot"))))
+    tm = note.find("time-modification")
+    if tm is not None:
+        try:
+            length = length * int(tm.findtext("normal-notes")) / int(tm.findtext("actual-notes"))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return length
+
+
+def normalise_durations(root: ET.Element) -> None:
+    """Fix bars whose durations were all written in the wrong unit, then give each part
+    a single <divisions> value. homr reads each page with its own unit and sometimes
+    misses a change when it joins pages: in a trio's cello part every note from page 4
+    on lasted half its printed value. A bar is only rescaled when every note in it is
+    off by the same factor, so genuine misreadings are left alone (and still flagged)."""
+    for part in root.findall("part"):
+        divisions = 1
+        timed: list[tuple[ET.Element, Fraction]] = []  # every <duration>'s owner, in crotchets
+        for m in part.findall("measure"):
+            in_bar: list[tuple[ET.Element, Fraction]] = []
+            for c in m:
+                if c.tag == "attributes" and c.findtext("divisions"):
+                    divisions = int(c.findtext("divisions"))
+                elif c.tag in ("note", "backup", "forward") and c.findtext("duration"):
+                    in_bar.append((c, Fraction(int(c.findtext("duration")), divisions)))
+            ratios = {written / printed for c, written in in_bar if c.tag == "note"
+                      and (printed := printed_length(c)) and written}
+            if len(ratios) == 1 and (k := ratios.pop()) != 1:
+                in_bar = [(c, length / k) for c, length in in_bar]
+            timed += in_bar
+        if not timed:
+            continue
+
+        unit = math.lcm(*(length.denominator for _, length in timed))
+        for c, length in timed:
+            c.find("duration").text = str(int(length * unit))
+        for m in part.findall("measure"):
+            for a in m.findall("attributes"):
+                for d in a.findall("divisions"):
+                    a.remove(d)
+                if len(a) == 0:
+                    m.remove(a)
+        first = part.find("measure")
+        attributes = first.find("attributes")
+        if attributes is None:
+            attributes = ET.Element("attributes")
+            first.insert(0, attributes)
+        ET.SubElement(attributes, "divisions").text = str(unit)
+
+
+# Number of beams each note value gets.
+BEAM_COUNT = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4, "128th": 5, "256th": 6}
+
+
+def beam_group_length(beats: int, beat_type: int) -> Fraction:
+    """Length of one beam group, in quarter notes, for a time signature."""
+    if beat_type == 8 and beats % 3 == 0:
+        return Fraction(3, 2)  # 3/8, 6/8, 9/8, 12/8: beam in dotted crotchets
+    if beat_type == 2:
+        return Fraction(2)  # 2/2, 3/2: beam in minims
+    return max(Fraction(4, beat_type), Fraction(1))  # beam per beat, at least a crotchet
+
+
+def _beam_run(run: list[ET.Element]) -> None:
+    """Add <beam> elements to a run of 2+ consecutive beamable notes."""
+    levels = [BEAM_COUNT[n.findtext("type")] for n in run]
+    for level in range(1, max(levels) + 1):
+        i = 0
+        while i < len(run):
+            if levels[i] < level:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(run) and levels[j + 1] >= level:
+                j += 1
+            if j > i:
+                for k in range(i, j + 1):
+                    value = "begin" if k == i else "end" if k == j else "continue"
+                    ET.SubElement(run[k], "beam", number=str(level)).text = value
+            else:  # a lone semiquaver next to quavers gets a stub ("hook")
+                value = "forward hook" if i == 0 else "backward hook"
+                ET.SubElement(run[i], "beam", number=str(level)).text = value
+            i = j + 1
+
+
+def add_beams(root: ET.Element) -> None:
+    """Join quavers and shorter notes with beams. homr doesn't output beaming, and
+    Sibelius keeps whatever the file says, so without this every quaver has its own
+    flag. Notes are beamed within each beat group of the time signature (and in 4/4
+    four plain quavers share a beam across a half bar); rests break beams."""
+    if root.find(".//beam") is not None:
+        return  # the file already has beaming; keep it
+    for part in root.findall("part"):
+        divisions, beats, beat_type = 1, None, None
+        measures = part.findall("measure")
+        for idx, m in enumerate(measures):
+            for a in m.findall("attributes"):
+                if a.findtext("divisions"):
+                    divisions = int(a.findtext("divisions"))
+                if a.find("time") is not None:
+                    try:
+                        beats = int(a.findtext("time/beats"))
+                        beat_type = int(a.findtext("time/beat-type"))
+                    except (TypeError, ValueError):
+                        beats = beat_type = None
+            if not beats or not beat_type:
+                continue
+
+            # (voice, onset, end, note) for each note that starts a chord, in quarters.
+            events, pos = [], 0
+            for c in m:
+                if c.tag == "note":
+                    if c.find("grace") is not None or c.find("chord") is not None:
+                        continue
+                    d = int(c.findtext("duration") or 0)
+                    events.append((c.findtext("voice") or "1", Fraction(pos, divisions),
+                                   Fraction(pos + d, divisions), c))
+                    pos += d
+                elif c.tag == "backup":
+                    pos -= int(c.findtext("duration") or 0)
+                elif c.tag == "forward":
+                    pos += int(c.findtext("duration") or 0)
+            if not events:
+                continue
+            bar = Fraction(beats * 4, beat_type)
+            filled = max(end for _, _, end, _ in events)
+            # In a pick-up bar the beats are counted from the end of the bar.
+            shift = bar - filled if idx == 0 and filled < bar else Fraction(0)
+            group = beam_group_length(beats, beat_type)
+
+            for voice in sorted({v for v, *_ in events}):
+                notes = sorted((e for e in events if e[0] == voice), key=lambda e: e[1])
+
+                def beamable(note: ET.Element) -> bool:
+                    return note.find("rest") is None and note.findtext("type") in BEAM_COUNT
+
+                def runs_in(span: Fraction) -> list[list[ET.Element]]:
+                    """Unbroken runs of beamable notes that stay inside one span."""
+                    runs, current, last_key, last_end = [], [], None, None
+                    for _, onset, end, note in notes:
+                        key = (onset + shift) // span
+                        fits = (end + shift) <= (key + 1) * span
+                        if beamable(note) and fits and key == last_key and onset == last_end:
+                            current.append(note)
+                        else:
+                            if len(current) > 1:
+                                runs.append(current)
+                            current = [note] if beamable(note) and fits else []
+                        last_key, last_end = key, end
+                    if len(current) > 1:
+                        runs.append(current)
+                    return runs
+
+                runs = runs_in(group)
+                if (beats, beat_type) == (4, 4):  # four plain quavers per half bar
+                    halves = [r for r in runs_in(Fraction(2)) if len(r) == 4
+                              and all(n.findtext("type") == "eighth" and n.find("dot") is None
+                                      for n in r)]
+                    joined = {id(n) for r in halves for n in r}
+                    runs = halves + [r for r in runs if not joined & {id(n) for n in r}]
+                for run in runs:
+                    _beam_run(run)
+
+
+# General MIDI programs (1-based) for instrument names the user types, checked in order
+# (so "alto sax" wins over "alto", "bass clarinet" over "clarinet").
+GM_PROGRAMS = [
+    ("piccolo", 73), ("flute", 74), ("oboe", 69), ("cor anglais", 70), ("english horn", 70),
+    ("clarinet", 72), ("bassoon", 71), ("recorder", 75),
+    ("soprano sax", 65), ("alto sax", 66), ("tenor sax", 67), ("baritone sax", 68),
+    ("saxophone", 66), ("horn", 61), ("trumpet", 57), ("cornet", 57), ("trombone", 58),
+    ("tuba", 59), ("timpani", 48), ("xylophone", 14), ("marimba", 13), ("vibraphone", 12),
+    ("glockenspiel", 10), ("celesta", 9), ("harpsichord", 7), ("organ", 20),
+    ("accordion", 22), ("harmonica", 23), ("piano", 1), ("keyboard", 1), ("harp", 47),
+    ("bass guitar", 34), ("electric guitar", 27), ("guitar", 25),
+    ("violoncello", 43), ("cello", 43), ("viola", 42), ("violin", 41), ("fiddle", 41),
+    ("double bass", 44), ("contrabass", 44), ("string bass", 44),
+    ("choir", 53), ("soprano", 54), ("mezzo", 54), ("alto", 54), ("tenor", 54),
+    ("baritone", 54), ("voice", 54), ("vocal", 54),
+]
+
+
+def gm_program(name: str) -> int | None:
+    lowered = name.lower()
+    return next((program for key, program in GM_PROGRAMS if key in lowered), None)
+
+
+def set_instruments(root: ET.Element, names: list[str] | None) -> list[str]:
+    """Name the parts, top to bottom, from `names`. Single-staff parts without a name
+    are left undefined (no name, instrument or sound): homr calls them all "Voice",
+    which made Sibelius give e.g. a cello line a singer's range and colour its notes
+    red. Braced two-staff parts keep homr's "Piano" unless named.
+    Returns the part names as written ("" = undefined)."""
+    names = [n.strip() for n in names or []]
+    part_list = root.find("part-list")
+    written = []
+    for i, sp in enumerate(part_list.findall("score-part") if part_list is not None else []):
+        pid = sp.get("id")
+        part = root.find(f"part[@id='{pid}']")
+        two_staves = part is not None and part.findtext("measure/attributes/staves") == "2"
+        name = names[i] if i < len(names) else ""
+        if not name and two_staves:
+            written.append(sp.findtext("part-name") or "")
+            continue
+        # Drop homr's instrument definition, and any notes that point at it.
+        for tag in ("score-instrument", "midi-device", "midi-instrument"):
+            for el in sp.findall(tag):
+                sp.remove(el)
+        for note in part.iter("note") if part is not None else ():
+            for ref in note.findall("instrument"):
+                note.remove(ref)
+        part_name = sp.find("part-name")
+        if part_name is None:
+            part_name = ET.SubElement(sp, "part-name")
+        part_name.text = name
+        if name:
+            instrument_id = f"{pid}-I1"
+            score_instrument = ET.SubElement(sp, "score-instrument", id=instrument_id)
+            ET.SubElement(score_instrument, "instrument-name").text = name
+            program = gm_program(name)
+            if program:
+                channel = [c for c in range(1, 17) if c != 10][i % 15]  # 10 is drums
+                midi = ET.SubElement(sp, "midi-instrument", id=instrument_id)
+                ET.SubElement(midi, "midi-channel").text = str(channel)
+                ET.SubElement(midi, "midi-program").text = str(program)
+        written.append(name)
+    return written
+
+
+def clean_for_sibelius(root: ET.Element, title: str | None, composer: str | None,
+                       instruments: list[str] | None = None) -> list[str]:
+    """Rewrite homr's output for Sibelius 7. Returns the part names written."""
     if root.tag != "score-partwise":
         raise RuntimeError(f"Unexpected MusicXML root <{root.tag}>")
     root.set("version", "2.0")
@@ -349,6 +594,7 @@ def clean_for_sibelius(root: ET.Element, title: str | None, composer: str | None
     if composer:
         set_text(root, ["identification", "creator"], composer, {"type": "composer"})
 
+    parts = set_instruments(root, instruments)
     downgrade_to_2_0(root)
 
     for measure in root.iter("measure"):
@@ -359,15 +605,20 @@ def clean_for_sibelius(root: ET.Element, title: str | None, composer: str | None
             for d in note.findall("duration"):
                 note.remove(d)
 
+    normalise_durations(root)
+    add_beams(root)
+
     for el in root.iter():
         order = CHILD_ORDER.get(el.tag)
         if order:
             reorder_children(el, order)
+    return parts
 
 
 def check_measures(root: ET.Element) -> list[str]:
-    """Return measure numbers whose contents don't add up to the time signature."""
-    bad = []
+    """Return measure numbers whose contents don't add up to the time signature
+    (in any part; each number listed once)."""
+    bad: list[str] = []
     for part in root.findall("part"):
         divisions, expected = 1, None
         measures = part.findall("measure")
@@ -394,9 +645,10 @@ def check_measures(root: ET.Element) -> list[str]:
                 longest = max(longest, pos)
             length = Fraction(longest, divisions)
             is_edge = idx in (0, len(measures) - 1)  # pick-up / final bar may be short
-            if length > expected or (length < expected and not is_edge):
-                bad.append(m.get("number", str(idx + 1)))
-    return bad
+            number = m.get("number", str(idx + 1))
+            if (length > expected or (length < expected and not is_edge)) and number not in bad:
+                bad.append(number)
+    return sorted(bad, key=lambda n: (len(n), n))
 
 
 def write_xml(root: ET.Element, path: Path) -> None:
@@ -416,6 +668,7 @@ class Result:
     bad_bars: list[str]
     seconds: float
     device: str
+    parts: list[str] = field(default_factory=list)  # top to bottom; "" = undefined
     warnings: list[str] = field(default_factory=list)
 
 
@@ -434,8 +687,10 @@ def default_output(first_input: Path) -> Path:
 
 def convert(inputs: list[Path], output: Path | None = None, title: str | None = None,
             composer: str | None = None, device: str = "auto", log: Log = print,
-            holder: ProcessHolder | None = None) -> Result:
-    """Recognise the pages (joined in order into one score) and write Sibelius-ready MusicXML."""
+            holder: ProcessHolder | None = None,
+            instruments: list[str] | None = None) -> Result:
+    """Recognise the pages (joined in order into one score) and write Sibelius-ready
+    MusicXML. `instruments` names the parts top to bottom; unnamed ones stay undefined."""
     if not inputs:
         raise ValueError("No pages given.")
     for p in inputs:
@@ -480,16 +735,29 @@ def convert(inputs: list[Path], output: Path | None = None, title: str | None = 
         warnings.append(f"The {BACKENDS[device].label} couldn't be used for every step, "
                         "so part of the work ran on the CPU.")
 
-    clean_for_sibelius(root, title, composer)
+    parts = clean_for_sibelius(root, title, composer, instruments)
+    given = [n.strip() for n in instruments or []]
+    while given and not given[-1]:
+        given.pop()
+    if given and len(given) != len(parts):
+        warnings.append(f"You gave {len(given)} instrument name(s) but the score has "
+                        f"{len(parts)} part(s); they were applied top to bottom.")
     out.parent.mkdir(parents=True, exist_ok=True)
     write_xml(root, out)
     return Result(output=out,
-                  bars=len(root.findall("part/measure")),
+                  bars=len(root.findall("part")[0].findall("measure")),
                   notes=sum(1 for n in root.iter("note") if n.find("rest") is None),
                   bad_bars=check_measures(root),
                   seconds=time.time() - started,
                   device=device,
+                  parts=parts,
                   warnings=warnings)
+
+
+def describe_parts(parts: list[str]) -> str:
+    """e.g. "3 parts: Violin, Violin, (undefined)"."""
+    shown = ", ".join(p or "(undefined)" for p in parts)
+    return f"{len(parts)} part{'s' if len(parts) != 1 else ''}: {shown}"
 
 
 # --------------------------------------------------------------------------- CLI
@@ -528,6 +796,9 @@ def main() -> int:
                     help="output .xml file (default: next to the first input)")
     ap.add_argument("--title", help="score title (homr guesses one; pass '' for none)")
     ap.add_argument("--composer", help="composer name")
+    ap.add_argument("--instruments", metavar="LIST",
+                    help='instrument per part, top to bottom, e.g. "Violin, Violin, Cello" '
+                         "(default: leave single-staff parts undefined)")
     ap.add_argument("--device", choices=["auto", *BACKENDS], default="auto",
                     help="processor to use (default: fastest one installed)")
     ap.add_argument("--install", choices=list(BACKENDS), metavar="{cpu,nvidia,amd}",
@@ -546,11 +817,12 @@ def main() -> int:
     quiet = lambda line: None  # noqa: E731
     try:
         r = convert(args.inputs, args.output, args.title, args.composer, device,
-                    log=print if args.verbose else quiet)
+                    log=print if args.verbose else quiet,
+                    instruments=args.instruments.split(",") if args.instruments else None)
     except (RuntimeError, ValueError, FileNotFoundError) as e:
         raise SystemExit(str(e))
 
-    print(f"Done in {r.seconds:.0f}s: {r.bars} bars, {r.notes} notes.")
+    print(f"Done in {r.seconds:.0f}s: {r.bars} bars, {r.notes} notes, {describe_parts(r.parts)}.")
     print(f"Saved: {r.output}")
     for w in r.warnings:
         print(f"Note: {w}")

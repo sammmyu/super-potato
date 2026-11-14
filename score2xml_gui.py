@@ -194,12 +194,19 @@ class App:
         e = ttk.Entry(form, textvariable=self.composer_var)
         e.grid(row=1, column=1, sticky="ew", pady=2)
         self.controls.append(e)
-        ttk.Label(form, text="Save as").grid(row=2, column=0, sticky="w", padx=(0, 10))
-        e = ttk.Entry(form, textvariable=self.output_var)
+        self.instruments_var = tk.StringVar()
+        ttk.Label(form, text="Instruments").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        e = ttk.Entry(form, textvariable=self.instruments_var)
         e.grid(row=2, column=1, sticky="ew", pady=2)
         self.controls.append(e)
+        ttk.Label(form, text="Top to bottom, e.g. Violin, Violin, Cello. Blank = undefined",
+                  style="Hint.TLabel").grid(row=2, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(form, text="Save as").grid(row=3, column=0, sticky="w", padx=(0, 10))
+        e = ttk.Entry(form, textvariable=self.output_var)
+        e.grid(row=3, column=1, sticky="ew", pady=2)
+        self.controls.append(e)
         b = ttk.Button(form, text="Browse…", command=self.browse_output)
-        b.grid(row=2, column=2, sticky="w", padx=(8, 0))
+        b.grid(row=3, column=2, sticky="w", padx=(8, 0))
         self.controls.append(b)
         self.output_var.trace_add("write", self._output_edited)
 
@@ -473,6 +480,7 @@ class App:
 
         title = self.title_var.get().strip() or None
         composer = self.composer_var.get().strip() or None
+        instruments = self.instruments_var.get().split(",") if self.instruments_var.get().strip() else None
         pages = list(self.pages)
         self.settings["device"] = self.device_var.get()
         save_settings(self.settings)
@@ -481,7 +489,7 @@ class App:
             f"Reading {len(pages)} file(s) on {core.BACKENDS[device].label}…",
             lambda holder: core.convert(pages, out, title, composer, device,
                                         log=lambda line: self.q.put(("log", line)),
-                                        holder=holder))
+                                        holder=holder, instruments=instruments))
 
     def install(self, key: str) -> None:
         b = core.BACKENDS[key]
@@ -518,7 +526,8 @@ class App:
         self.last_result = r
         self.result_text.configure(
             text=f"Saved {r.output.name} — {r.bars} bars, {r.notes} notes, "
-                 f"{r.seconds:.0f} s on {core.BACKENDS[r.device].label}.\n{r.output.parent}")
+                 f"{r.seconds:.0f} s on {core.BACKENDS[r.device].label}.\n"
+                 f"{core.describe_parts(r.parts)}\n{r.output.parent}")
         notes = list(r.warnings)
         if r.bad_bars:
             shown = ", ".join(r.bad_bars[:20]) + (" …" if len(r.bad_bars) > 20 else "")

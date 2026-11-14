@@ -8,6 +8,11 @@ Double-click **`Score to MusicXML.bat`**. You can also drop images or PDFs onto 
 
 1. **Pages:** drop images or PDFs into the list, or click *Add files…*. Pages are joined top to bottom into one score; use *Move up* / *Move down* to fix the order.
 2. **Title / Composer:** optional. Leave Title blank to use the title found on the page.
+   **Instruments:** optional, one per line of music, top to bottom, e.g. `Violin, Violin, Cello`.
+   - Each named part gets that name and a matching General MIDI playback sound, so Sibelius can choose the right instrument and range.
+   - Leave it blank and single-line parts stay undefined, with no name or instrument.
+   - Braced two-staff parts are written as Piano unless you name them.
+   - The result line shows how many parts were found.
 3. **Save as:** defaults to the first page's name with `.xml`, in the same folder. Existing files aren't overwritten; you get `name (2).xml` instead.
 4. **Processor:** *Automatic* picks the fastest one installed for your graphics card. A processor that isn't set up yet shows an **Install** button (see below).
 5. **Convert.** When it finishes, **Open in Sibelius** opens the file directly. The first time, it asks where `Sibelius.exe` is if it can't find it. **Show in folder** opens the output folder.
@@ -37,6 +42,7 @@ All three give identical notes on the test page.
 score2xml.bat my-score.jpg
 score2xml.bat page1.jpg page2.jpg --title "Minuet in G" --composer "Petzold" --device nvidia
 score2xml.bat scan.pdf -o "D:\Scores\minuet.xml"
+score2xml.bat trio.pdf --instruments "Violin, Violin, Cello"
 python score2xml.py --install amd
 ```
 
@@ -52,6 +58,16 @@ python score2xml.py --install amd
    - Output is checked against the official MusicXML 2.0 DTD and XSD.
    - It also drops homr's placeholder page size, and drops the title when homr has mistaken a tempo mark for one.
    - The notes themselves aren't changed. The only 3.0+ feature homr currently writes is the instrument-sound tag ("keyboard.piano"). The full list is there in case a later homr version adds more.
+4. Adds beams. homr doesn't output beaming, and Sibelius keeps whatever the file says, so without this every quaver would have its own flag. The script beams by time signature:
+   - quavers and shorter notes are grouped per beat (dotted crotchets in 6/8, 9/8 and 12/8; minims in 2/2)
+   - in 4/4, four plain quavers share a beam across a half bar
+   - semiquavers get secondary beams or stubs
+   - rests break beams
+   - in a pick-up bar, beats are counted from the end of the bar
+
+   If a bar looks wrongly beamed, use Sibelius's own beaming tools on it.
+5. **Doesn't guess instruments.** homr calls every single-line part "Voice". Sibelius then gave a cello line a singer's range and showed its notes in red as out of range. Unnamed parts are now left undefined (see *Instruments* above).
+6. **Fixes note lengths across pages.** homr reads each page separately and sometimes stores a part's note lengths in the wrong unit when it joins them. In a trio, the cello's minims from page 4 on each lasted only a crotchet. Bars where every note is off by the same factor are corrected to the printed note values, and each part gets one consistent unit. Genuine misreadings are left alone and still flagged.
 
 ## Getting good results
 
